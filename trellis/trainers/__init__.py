@@ -18,6 +18,7 @@ __attributes = {
     'SparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'TextConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
     'ImageConditionedSparseFlowMatchingCFGTrainer': 'flow_matching.sparse_flow_matching',
+    'ImageConditionedStage2GRPOTrainer': 'grpo',
 }
 
 __submodules = []
@@ -61,3 +62,4 @@ if __name__ == '__main__':
         TextConditionedSparseFlowMatchingCFGTrainer,
         ImageConditionedSparseFlowMatchingCFGTrainer,
     )
+    from .grpo import ImageConditionedStage2GRPOTrainer
