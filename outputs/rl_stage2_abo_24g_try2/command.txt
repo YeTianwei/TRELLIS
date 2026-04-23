@@ -1,0 +1,1 @@
+python train.py --config configs/rl/slat_flow_img_grpo_lora_gs.json --output_dir outputs/rl_stage2_abo_24g_try2 --data_dir datasets/ABO --num_gpus 1 --auto_retry 0

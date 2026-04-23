@@ -17,6 +17,7 @@ from ..pipelines import samplers
 from ..pipelines.rollout_stage2_grpo import TrellisStage2GRPORollout
 from ..utils import dist_utils
 from ..utils.data_utils import ResumableSampler, cycle, recursive_to_device
+from ..utils import elastic_utils
 from ..utils.general_utils import dict_reduce
 from ..utils.lora_utils import (
     LoraSpec,
@@ -183,6 +184,8 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
             f"  - Dataloader workers: {self.dataloader.num_workers}",
             f"  - Persistent workers: {self.dataloader.persistent_workers}",
         ]
+        if self.elastic_controller_config is not None:
+            lines.append(f"  - Elastic memory: {self.elastic_controller}")
         return "\n".join(lines)
 
     def prepare_dataloader(self, **kwargs):
@@ -297,8 +300,22 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         else:
             self.training_models = {"denoiser": denoiser}
 
+        if self.elastic_controller_config is not None:
+            assert any(
+                isinstance(model, (elastic_utils.ElasticModule, elastic_utils.ElasticModuleMixin))
+                for model in self.models.values()
+            ), "No elastic module found in models, please inherit from ElasticModule or ElasticModuleMixin"
+            self.elastic_controller = getattr(elastic_utils, self.elastic_controller_config["name"])(
+                **self.elastic_controller_config["args"]
+            )
+            for model in self.models.values():
+                if isinstance(model, (elastic_utils.ElasticModule, elastic_utils.ElasticModuleMixin)):
+                    model.register_memory_controller(self.elastic_controller)
+
         self.model_params = get_lora_trainable_parameters(self.models["denoiser"])
         self.master_params = self.model_params
+        if self.fp16_mode == "amp":
+            self.scaler = torch.GradScaler()
         if self.is_master:
             self.ema_params = []
 
@@ -320,6 +337,8 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         self.data_sampler.load_state_dict(misc["data_sampler"])
         if self.lr_scheduler_config is not None and "lr_scheduler" in misc:
             self.lr_scheduler.load_state_dict(misc["lr_scheduler"])
+        if self.elastic_controller_config is not None and "elastic_controller" in misc:
+            self.elastic_controller.load_state_dict(misc["elastic_controller"])
         if self.world_size > 1:
             dist.barrier()
         if self.is_master:
@@ -342,6 +361,8 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         }
         if self.lr_scheduler_config is not None:
             misc["lr_scheduler"] = self.lr_scheduler.state_dict()
+        if self.elastic_controller_config is not None:
+            misc["elastic_controller"] = self.elastic_controller.state_dict()
         torch.save(misc, os.path.join(self.output_dir, "ckpts", f"misc_step{self.step:07d}.pt"))
         print(" Done.")
 
@@ -427,96 +448,119 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
 
     def run_step(self, data_list):
         amp_context = torch.autocast(device_type="cuda") if self.fp16_mode == "amp" else nullcontext()
+        elastic_controller_context = self.elastic_controller.record if self.elastic_controller_config is not None else nullcontext
         stats = []
+        elastic_controller_logs = []
         train_model = self.training_models["denoiser"]
         self.optimizer.zero_grad()
 
         for data in data_list:
-            data = recursive_to_device(data, self.device, non_blocking=True)
-            batch_stats = []
-            for cond in data["cond"]:
-                with torch.no_grad():
-                    rollout = self.rollout.rollout_group(self._unwrap_training_model(), cond, group_size=self.group_size, train=True)
-                    reward_info = self.reward_evaluator.score(cond.unsqueeze(0).repeat(self.group_size, 1, 1, 1), rollout["renders"])
-                    advantages = self._advantage(reward_info["reward"])
+            with elastic_controller_context():
+                data = recursive_to_device(data, self.device, non_blocking=True)
+                batch_stats = []
+                for cond in data["cond"]:
+                    with torch.no_grad():
+                        rollout = self.rollout.rollout_group(self._unwrap_training_model(), cond, group_size=self.group_size, train=True)
+                        reward_info = self.reward_evaluator.score(cond.unsqueeze(0).repeat(self.group_size, 1, 1, 1), rollout["renders"])
+                        advantages = self._advantage(reward_info["reward"])
 
-                if advantages.abs().sum() == 0:
-                    if self.log_reward_details:
-                        batch_stats.append(
-                            {
-                                "reward": reward_info["reward"].mean().item(),
-                                "image_align": reward_info["image_align"].mean().item(),
-                                "aesthetic": reward_info["aesthetic"].mean().item(),
-                                "skipped_zero_adv": 1.0,
-                            }
-                        )
-                    continue
+                    if advantages.abs().sum() == 0:
+                        if self.log_reward_details:
+                            batch_stats.append(
+                                {
+                                    "reward": reward_info["reward"].mean().item(),
+                                    "image_align": reward_info["image_align"].mean().item(),
+                                    "aesthetic": reward_info["aesthetic"].mean().item(),
+                                    "skipped_zero_adv": 1.0,
+                                }
+                            )
+                        continue
 
-                policy_terms = []
-                kl_terms = []
-                clipfracs = []
-                for j in range(self.train_rollout_steps):
-                    with amp_context:
-                        step_out = self.stage2_sampler.step_with_logprob(
-                            train_model,
-                            rollout["trajectory"].latents[j],
-                            float(rollout["trajectory"].timesteps[j].item()),
-                            self._t_prev(rollout["trajectory"].timesteps, j),
-                            rollout["cond"]["cond"],
-                            neg_cond=rollout["cond"]["neg_cond"],
-                            cfg_strength=self.train_cfg_strength,
-                            noise_level=self.train_noise_level,
-                            next_sample=rollout["trajectory"].next_latents[j],
-                        )
-                        with torch.no_grad():
-                            with disable_lora(self._unwrap_training_model()):
-                                ref_out = self.stage2_sampler.step_with_logprob(
-                                    train_model,
-                                    rollout["trajectory"].latents[j],
-                                    float(rollout["trajectory"].timesteps[j].item()),
-                                    self._t_prev(rollout["trajectory"].timesteps, j),
-                                    rollout["cond"]["cond"],
-                                    neg_cond=rollout["cond"]["neg_cond"],
-                                    cfg_strength=self.train_cfg_strength,
-                                    noise_level=self.train_noise_level,
-                                    next_sample=rollout["trajectory"].next_latents[j],
-                                )
+                    policy_terms = []
+                    kl_terms = []
+                    clipfracs = []
+                    for j in range(self.train_rollout_steps):
+                        with amp_context:
+                            step_out = self.stage2_sampler.step_with_logprob(
+                                train_model,
+                                rollout["trajectory"].latents[j],
+                                float(rollout["trajectory"].timesteps[j].item()),
+                                self._t_prev(rollout["trajectory"].timesteps, j),
+                                rollout["cond"]["cond"],
+                                neg_cond=rollout["cond"]["neg_cond"],
+                                cfg_strength=self.train_cfg_strength,
+                                noise_level=self.train_noise_level,
+                                next_sample=rollout["trajectory"].next_latents[j],
+                            )
+                            with torch.no_grad():
+                                with disable_lora(self._unwrap_training_model()):
+                                    ref_out = self.stage2_sampler.step_with_logprob(
+                                        train_model,
+                                        rollout["trajectory"].latents[j],
+                                        float(rollout["trajectory"].timesteps[j].item()),
+                                        self._t_prev(rollout["trajectory"].timesteps, j),
+                                        rollout["cond"]["cond"],
+                                        neg_cond=rollout["cond"]["neg_cond"],
+                                        cfg_strength=self.train_cfg_strength,
+                                        noise_level=self.train_noise_level,
+                                        next_sample=rollout["trajectory"].next_latents[j],
+                                    )
 
-                        old_log_prob = rollout["trajectory"].log_probs[:, j]
-                        ratio = torch.exp(step_out.log_prob - old_log_prob)
-                        unclipped = -advantages * ratio
-                        clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range)
-                        policy_loss = torch.maximum(unclipped, clipped).mean()
-                        std = step_out.std.view(-1, 1, 1)
-                        mean_diff = step_out.pred_x_prev_mean.feats - ref_out.pred_x_prev_mean.feats
-                        kl_loss = (mean_diff.square() / (2 * std[step_out.pred_x_prev_mean.coords[:, 0]].square().clamp_min(1e-8))).mean()
-                        policy_terms.append(policy_loss)
-                        kl_terms.append(kl_loss)
-                        clipfracs.append((torch.abs(ratio - 1.0) > self.clip_range).float().mean())
+                            old_log_prob = rollout["trajectory"].log_probs[:, j]
+                            ratio = torch.exp(step_out.log_prob - old_log_prob)
+                            unclipped = -advantages * ratio
+                            clipped = -advantages * torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range)
+                            policy_loss = torch.maximum(unclipped, clipped).mean()
+                            # `mean_diff` is [num_sparse_tokens, channels], so the per-sample
+                            # std needs shape [batch, 1]. Using [batch, 1, 1] would broadcast
+                            # against `mean_diff` to a massive [tokens, tokens, channels] tensor.
+                            std = step_out.std.view(-1, 1)
+                            mean_diff = step_out.pred_x_prev_mean.feats - ref_out.pred_x_prev_mean.feats
+                            kl_loss = (
+                                mean_diff.square()
+                                / (2 * std[step_out.pred_x_prev_mean.coords[:, 0]].square().clamp_min(1e-8))
+                            ).mean()
+                            policy_terms.append(policy_loss)
+                            kl_terms.append(kl_loss)
+                            clipfracs.append((torch.abs(ratio - 1.0) > self.clip_range).float().mean())
 
-                loss = torch.stack(policy_terms).mean() + self.beta * torch.stack(kl_terms).mean()
-                loss.backward()
+                    loss = torch.stack(policy_terms).mean() + self.beta * torch.stack(kl_terms).mean()
+                    if self.fp16_mode == "amp":
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
-                batch_stats.append(
-                    {
-                        "reward": reward_info["reward"].mean().item(),
-                        "image_align": reward_info["image_align"].mean().item(),
-                        "aesthetic": reward_info["aesthetic"].mean().item(),
-                        "adv_abs": advantages.abs().mean().item(),
-                        "policy_loss": torch.stack(policy_terms).mean().item(),
-                        "kl_loss": torch.stack(kl_terms).mean().item(),
-                        "clipfrac": torch.stack(clipfracs).mean().item(),
-                    }
-                )
+                    batch_stats.append(
+                        {
+                            "reward": reward_info["reward"].mean().item(),
+                            "image_align": reward_info["image_align"].mean().item(),
+                            "aesthetic": reward_info["aesthetic"].mean().item(),
+                            "adv_abs": advantages.abs().mean().item(),
+                            "policy_loss": torch.stack(policy_terms).mean().item(),
+                            "kl_loss": torch.stack(kl_terms).mean().item(),
+                            "clipfrac": torch.stack(clipfracs).mean().item(),
+                        }
+                    )
 
             if batch_stats:
                 stats.extend(batch_stats)
+            if self.elastic_controller_config is not None:
+                elastic_controller_logs.append(self.elastic_controller.log())
 
         if not stats:
-            return {"loss": {"loss": 0.0}, "status": {"skipped": 1.0}}
+            out = {"loss": {"loss": 0.0}, "status": {"skipped": 1.0}}
+            if self.elastic_controller_config is not None and elastic_controller_logs:
+                out["elastic"] = dict_reduce(elastic_controller_logs, lambda x: float(np.mean(x)))
+            return out
 
+        if self.fp16_mode == "amp":
+            self.scaler.unscale_(self.optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(self.master_params, self.grad_clip) if self.grad_clip is not None else torch.tensor(0.0)
-        self.optimizer.step()
+        if self.fp16_mode == "amp":
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
         if self.lr_scheduler_config is not None:
             self.lr_scheduler.step()
         reduced = dict_reduce(stats, lambda x: float(np.mean(x)))
@@ -527,4 +571,6 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
             "policy_loss": reduced.get("policy_loss", 0.0),
             "kl_loss": reduced.get("kl_loss", 0.0),
         }
+        if self.elastic_controller_config is not None and elastic_controller_logs:
+            reduced["elastic"] = dict_reduce(elastic_controller_logs, lambda x: float(np.mean(x)))
         return reduced
