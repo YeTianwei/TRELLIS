@@ -32,8 +32,10 @@ class LoraLinear(nn.Module):
         self.scaling = alpha / max(rank, 1)
         self.enabled = True
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank))
+        # Keep LoRA trainables in fp32 so AMP/GradScaler can safely unscale
+        # gradients even when the frozen base module itself runs in fp16.
+        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, dtype=torch.float32))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, dtype=torch.float32))
         self.reset_parameters()
         self._move_to_base_device()
         self.base.weight.requires_grad_(False)
@@ -42,9 +44,8 @@ class LoraLinear(nn.Module):
 
     def _move_to_base_device(self):
         device = self.base.weight.device
-        dtype = self.base.weight.dtype
-        self.lora_A.data = self.lora_A.data.to(device=device, dtype=dtype)
-        self.lora_B.data = self.lora_B.data.to(device=device, dtype=dtype)
+        self.lora_A.data = self.lora_A.data.to(device=device)
+        self.lora_B.data = self.lora_B.data.to(device=device)
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
@@ -54,10 +55,11 @@ class LoraLinear(nn.Module):
         return f"rank={self.rank}, alpha={self.alpha}"
 
     def _delta(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dropout(x)
+        out_dtype = x.dtype
+        x = self.dropout(x).to(dtype=self.lora_A.dtype)
         x = F.linear(x, self.lora_A)
         x = F.linear(x, self.lora_B)
-        return x * self.scaling
+        return (x * self.scaling).to(dtype=out_dtype)
 
     def forward(self, x):
         if not self.enabled:

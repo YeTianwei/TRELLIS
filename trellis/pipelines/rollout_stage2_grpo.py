@@ -140,6 +140,9 @@ class TrellisStage2GRPORollout:
             num_views=self.train_num_views if train else self.eval_num_views,
             resolution=self.train_render_resolution if train else self.eval_render_resolution,
         )
+        if group_size == 2:
+            diff = (renders[0] - renders[1]).abs().mean()
+            print("rollout_group render diff:", diff.item())
         return {
             "coords": coords,
             "batch_coords": batch_coords,

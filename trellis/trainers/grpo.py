@@ -100,6 +100,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         lora_rank: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.0,
+        stage2_denoiser_path: str = "",
         sparse_structure_flow_model_path: str = "",
         sparse_structure_decoder_path: str = "",
         slat_decoder_gs_path: str = "",
@@ -140,6 +141,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+        self.stage2_denoiser_path = stage2_denoiser_path
         self.sparse_structure_flow_model_path = sparse_structure_flow_model_path
         self.sparse_structure_decoder_path = sparse_structure_decoder_path
         self.slat_decoder_gs_path = slat_decoder_gs_path
@@ -209,6 +211,12 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
 
     def init_models_and_more(self, **kwargs):
         denoiser = self.models["denoiser"].cuda()
+        if self.stage2_denoiser_path:
+            if self.is_master:
+                print(f"Loading stage2 denoiser weights from {self.stage2_denoiser_path}")
+            pretrained_denoiser = models.from_pretrained(self.stage2_denoiser_path).cuda().eval()
+            denoiser.load_state_dict(pretrained_denoiser.state_dict(), strict=True)
+            del pretrained_denoiser
         for param in denoiser.parameters():
             param.requires_grad_(False)
 
@@ -353,6 +361,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
             "step": self.step,
             "data_sampler": self.data_sampler.state_dict(),
             "base": {
+                "stage2_denoiser_path": self.stage2_denoiser_path,
                 "sparse_structure_flow_model_path": self.sparse_structure_flow_model_path,
                 "sparse_structure_decoder_path": self.sparse_structure_decoder_path,
                 "slat_decoder_gs_path": self.slat_decoder_gs_path,
@@ -455,10 +464,10 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         self.optimizer.zero_grad()
 
         for data in data_list:
-            with elastic_controller_context():
-                data = recursive_to_device(data, self.device, non_blocking=True)
-                batch_stats = []
-                for cond in data["cond"]:
+            data = recursive_to_device(data, self.device, non_blocking=True)
+            batch_stats = []
+            for cond in data["cond"]:
+                with elastic_controller_context():
                     with torch.no_grad():
                         rollout = self.rollout.rollout_group(self._unwrap_training_model(), cond, group_size=self.group_size, train=True)
                         reward_info = self.reward_evaluator.score(cond.unsqueeze(0).repeat(self.group_size, 1, 1, 1), rollout["renders"])
@@ -542,10 +551,11 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
                         }
                     )
 
+                if self.elastic_controller_config is not None:
+                    elastic_controller_logs.append(self.elastic_controller.log())
+
             if batch_stats:
                 stats.extend(batch_stats)
-            if self.elastic_controller_config is not None:
-                elastic_controller_logs.append(self.elastic_controller.log())
 
         if not stats:
             out = {"loss": {"loss": 0.0}, "status": {"skipped": 1.0}}
