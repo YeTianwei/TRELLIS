@@ -90,6 +90,9 @@ class LinearMemoryController(MemoryController):
         self._last_mem_ratio = []
         yield
         self._last_memory = torch.cuda.max_memory_allocated(self.device) / 1024**3
+        if len(self._last_mem_ratio) == 0 or self._last_input_size is None:
+            self._last_mem_ratio = 0.0
+            return
         self._last_mem_ratio = sum(self._last_mem_ratio) / len(self._last_mem_ratio)
         self._add_sample(self._last_memory, self._last_input_size, self._last_mem_ratio)
         self.step += 1
@@ -136,6 +139,14 @@ class LinearMemoryController(MemoryController):
         self._params = tuple(state_dict['params'])
         
     def log(self):
+        if self._last_input_size is None:
+            return {
+                'params/k': float(self._params[0]),
+                'params/b': float(self._params[1]),
+                'memory': float(getattr(self, '_last_memory', 0.0)),
+                'input_size': 0.0,
+                'mem_ratio': float(getattr(self, '_last_mem_ratio', 0.0)),
+            }
         return {
             'params/k': self._params[0],
             'params/b': self._params[1],

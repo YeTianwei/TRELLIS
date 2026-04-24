@@ -14,6 +14,7 @@ __attributes = {
     'SLat': 'structured_latent',
     'TextConditionedSLat': 'structured_latent',
     'ImageConditionedSLat': 'structured_latent',
+    'ImageConditionedRL': 'rl_image_conditioned',
 }
 
 __submodules = []
@@ -55,4 +56,5 @@ if __name__ == '__main__':
         TextConditionedSLat,
         ImageConditionedSLat,
     )
+    from .rl_image_conditioned import ImageConditionedRL
     

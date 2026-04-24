@@ -1,0 +1,119 @@
+{
+    "models": {
+        "denoiser": {
+            "name": "ElasticSLatFlowModel",
+            "args": {
+                "resolution": 64,
+                "in_channels": 8,
+                "out_channels": 8,
+                "model_channels": 1024,
+                "cond_channels": 1024,
+                "num_blocks": 24,
+                "num_heads": 16,
+                "mlp_ratio": 4,
+                "patch_size": 2,
+                "num_io_res_blocks": 2,
+                "io_block_channels": [128],
+                "pe_mode": "ape",
+                "qk_rms_norm": true,
+                "use_fp16": true
+            }
+        }
+    },
+    "dataset": {
+        "name": "ImageConditionedRL",
+        "args": {
+            "image_size": 518,
+            "min_aesthetic_score": 4.5
+        }
+    },
+    "trainer": {
+        "name": "ImageConditionedStage2GRPOTrainer",
+        "args": {
+            "max_steps": 200,
+            "batch_size_per_gpu": 1,
+            "batch_split": 1,
+            "optimizer": {
+                "name": "AdamW",
+                "args": {
+                    "lr": 0.0001,
+                    "weight_decay": 0.0
+                }
+            },
+            "ema_rate": [],
+            "elastic": {
+                "name": "LinearMemoryController",
+                "args": {
+                    "target_ratio": 0.5,
+                    "max_mem_ratio_start": 0.05
+                }
+            },
+            "fp16_mode": "amp",
+            "grad_clip": 1.0,
+            "i_print": 10,
+            "i_log": 10,
+            "i_sample": 100,
+            "i_save": 100,
+            "image_cond_model": "dinov2_vitl14_reg",
+            "image_cond_repo_or_dir": "/home/timer/.cache/torch/hub/facebookresearch_dinov2_main",
+            "image_cond_source": "local",
+            "image_cond_size": 336,
+            "lora_rank": 16,
+            "lora_alpha": 32,
+            "stage2_denoiser_path": "microsoft/TRELLIS-image-large/ckpts/slat_flow_img_dit_L_64l8p2_fp16",
+            "group_size": 2,
+            "train_rollout_steps": 2,
+            "eval_rollout_steps": 4,
+            "train_noise_level": 0.8,
+            "eval_noise_level": 0.0,
+            "train_cfg_strength": 3.0,
+            "eval_cfg_strength": 3.0,
+            "clip_range": 0.0001,
+            "beta": 0.01,
+            "reward_image_align_weight": 1.0,
+            "reward_aesthetic_weight": 0.0,
+            "reward_topk_views": 1,
+            "reward_dino_batch_size": 1,
+            "reward_aesthetic_batch_size": 1,
+            "train_num_views": 1,
+            "eval_num_views": 4,
+            "train_render_resolution": 256,
+            "eval_render_resolution": 256,
+            "render_bg_color": [0, 0, 0],
+            "render_r": 2.0,
+            "render_fov": 40.0,
+            "enable_model_snapshot": false,
+            "slat_normalization": {
+                "mean": [
+                    -2.1687545776367188,
+                    -0.004347046371549368,
+                    -0.13352349400520325,
+                    -0.08418072760105133,
+                    -0.5271206498146057,
+                    0.7238689064979553,
+                    -1.1414450407028198,
+                    1.2039363384246826
+                ],
+                "std": [
+                    2.377650737762451,
+                    2.386378288269043,
+                    2.124418020248413,
+                    2.1748552322387695,
+                    2.663944721221924,
+                    2.371192216873169,
+                    2.6217446327209473,
+                    2.684523105621338
+                ]
+            },
+            "sparse_structure_flow_model_path": "microsoft/TRELLIS-image-large/ckpts/ss_flow_img_dit_L_16l8_fp16",
+            "sparse_structure_decoder_path": "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16",
+            "slat_decoder_gs_path": "microsoft/TRELLIS-image-large/ckpts/slat_dec_gs_swin8_B_64l8gs32_fp16",
+            "stage1_sampler": {
+                "name": "FlowEulerCfgSampler",
+                "args": {
+                    "sigma_min": 1e-5
+                }
+            }
+        }
+    }
+}
