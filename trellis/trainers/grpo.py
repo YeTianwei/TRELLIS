@@ -120,6 +120,8 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         reward_topk_views: int = 2,
         reward_dino_batch_size: int = 1,
         reward_aesthetic_batch_size: int = 1,
+        reward_normal_weight: float = 0.0,
+        reward_normal_mask_threshold: float = 0.1,
         train_num_views: int = 4,
         eval_num_views: int = 12,
         train_render_resolution: int = 256,
@@ -161,6 +163,8 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
         self.reward_topk_views = reward_topk_views
         self.reward_dino_batch_size = reward_dino_batch_size
         self.reward_aesthetic_batch_size = reward_aesthetic_batch_size
+        self.reward_normal_weight = reward_normal_weight
+        self.reward_normal_mask_threshold = reward_normal_mask_threshold
         self.train_num_views = train_num_views
         self.eval_num_views = eval_num_views
         self.train_render_resolution = train_render_resolution
@@ -258,6 +262,8 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
             topk_views=self.reward_topk_views,
             dino_batch_size=self.reward_dino_batch_size,
             aesthetic_batch_size=self.reward_aesthetic_batch_size,
+            normal_weight=self.reward_normal_weight,
+            normal_mask_threshold=self.reward_normal_mask_threshold,
             dino_encoder=self.image_encoder,
         )
 
@@ -292,6 +298,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
             render_bg_color=self.render_bg_color,
             render_r=self.render_r,
             render_fov=self.render_fov,
+            return_render_info=self.reward_normal_weight != 0,
             sigma_min=self.sigma_min,
         )
 
@@ -439,7 +446,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
             batch = recursive_to_device(batch, self.device)
             for cond in batch["cond"]:
                 rollout = self.rollout.rollout_group(self._unwrap_training_model(), cond, group_size=1, train=False)
-                score = self.reward_evaluator.score(cond.unsqueeze(0), rollout["renders"])
+                score = self.reward_evaluator.score(cond.unsqueeze(0), rollout["renders"], rollout.get("render_info"))
                 samples.append(rollout["renders"][0, 0])
                 conds.append(cond)
                 rewards.append(score["reward"][0:1])
@@ -470,7 +477,11 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
                 with elastic_controller_context():
                     with torch.no_grad():
                         rollout = self.rollout.rollout_group(self._unwrap_training_model(), cond, group_size=self.group_size, train=True)
-                        reward_info = self.reward_evaluator.score(cond.unsqueeze(0).repeat(self.group_size, 1, 1, 1), rollout["renders"])
+                        reward_info = self.reward_evaluator.score(
+                            cond.unsqueeze(0).repeat(self.group_size, 1, 1, 1),
+                            rollout["renders"],
+                            rollout.get("render_info"),
+                        )
                         advantages = self._advantage(reward_info["reward"])
 
                     if advantages.abs().sum() == 0:
@@ -480,6 +491,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
                                     "reward": reward_info["reward"].mean().item(),
                                     "image_align": reward_info["image_align"].mean().item(),
                                     "aesthetic": reward_info["aesthetic"].mean().item(),
+                                    "normal_depth_consistency": reward_info["normal_depth_consistency"].mean().item(),
                                     "skipped_zero_adv": 1.0,
                                 }
                             )
@@ -544,6 +556,7 @@ class ImageConditionedStage2GRPOTrainer(Trainer):
                             "reward": reward_info["reward"].mean().item(),
                             "image_align": reward_info["image_align"].mean().item(),
                             "aesthetic": reward_info["aesthetic"].mean().item(),
+                            "normal_depth_consistency": reward_info["normal_depth_consistency"].mean().item(),
                             "adv_abs": advantages.abs().mean().item(),
                             "policy_loss": torch.stack(policy_terms).mean().item(),
                             "kl_loss": torch.stack(kl_terms).mean().item(),

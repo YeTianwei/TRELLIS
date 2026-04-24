@@ -67,6 +67,8 @@
             "reward_topk_views": 1,
             "reward_dino_batch_size": 1,
             "reward_aesthetic_batch_size": 1,
+            "reward_normal_weight": 0.0,
+            "reward_normal_mask_threshold": 0.1,
             "train_num_views": 1,
             "eval_num_views": 1,
             "train_render_resolution": 128,

@@ -56,6 +56,7 @@ def get_renderer(sample, **kwargs):
         renderer.rendering_options.far = kwargs.get('far', 1.6)
         renderer.rendering_options.bg_color = kwargs.get('bg_color', (0, 0, 0))
         renderer.rendering_options.ssaa = kwargs.get('ssaa', 1)
+        renderer.rendering_options.return_aux = kwargs.get('return_aux', False)
         renderer.pipe.kernel_size = kwargs.get('kernel_size', 0.1)
         renderer.pipe.use_mip_gaussian = True
     elif isinstance(sample, MeshExtractResult):
@@ -81,7 +82,12 @@ def render_frames(sample, extrinsics, intrinsics, options={}, colors_overwrite=N
             res = renderer.render(sample, extr, intr, colors_overwrite=colors_overwrite)
             if 'color' not in rets: rets['color'] = []
             if 'depth' not in rets: rets['depth'] = []
+            if 'alpha' not in rets: rets['alpha'] = []
             rets['color'].append(np.clip(res['color'].detach().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8))
+            if 'alpha' in res:
+                rets['alpha'].append(res['alpha'].detach().cpu().numpy())
+            else:
+                rets['alpha'].append(None)
             if 'percent_depth' in res:
                 rets['depth'].append(res['percent_depth'].detach().cpu().numpy())
             elif 'depth' in res:

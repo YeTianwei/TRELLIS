@@ -31,6 +31,7 @@ class TrellisStage2GRPORollout:
         render_bg_color=(0, 0, 0),
         render_r: float = 2.0,
         render_fov: float = 40.0,
+        return_render_info: bool = False,
         sigma_min: float = 1e-5,
     ):
         self.stage1_flow_model = stage1_flow_model
@@ -52,6 +53,7 @@ class TrellisStage2GRPORollout:
         self.render_bg_color = render_bg_color
         self.render_r = render_r
         self.render_fov = render_fov
+        self.return_render_info = return_render_info
         self.sigma_min = sigma_min
         self._slat_mean = torch.tensor(slat_normalization["mean"]).reshape(1, -1).cuda()
         self._slat_std = torch.tensor(slat_normalization["std"]).reshape(1, -1).cuda()
@@ -93,23 +95,42 @@ class TrellisStage2GRPORollout:
         return reps, slat
 
     @torch.no_grad()
-    def render_gaussians(self, gaussians, num_views: int, resolution: int):
+    def render_gaussians(self, gaussians, num_views: int, resolution: int, return_info: bool = False):
         cams = [render_utils.sphere_hammersley_sequence(i, num_views) for i in range(num_views)]
         yaws = [cam[0] for cam in cams]
         pitchs = [cam[1] for cam in cams]
         extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, self.render_r, self.render_fov)
         rendered = []
+        alphas = []
+        depths = []
         for gaussian in gaussians:
-            frames = render_utils.render_frames(
+            frame_info = render_utils.render_frames(
                 gaussian,
                 extrinsics,
                 intrinsics,
-                options={"resolution": resolution, "bg_color": self.render_bg_color},
+                options={"resolution": resolution, "bg_color": self.render_bg_color, "return_aux": return_info},
                 verbose=False,
-            )["color"]
+            )
+            frames = frame_info["color"]
             frames = torch.stack([torch.tensor(frame).permute(2, 0, 1).float() / 255.0 for frame in frames], dim=0)
             rendered.append(frames.cuda())
-        return torch.stack(rendered, dim=0)
+            if return_info:
+                alpha_frames = frame_info.get("alpha", [])
+                depth_frames = frame_info.get("depth", [])
+                if alpha_frames and all(frame is not None for frame in alpha_frames):
+                    alphas.append(torch.stack([torch.tensor(frame).float() for frame in alpha_frames], dim=0).cuda())
+                if depth_frames and all(frame is not None for frame in depth_frames):
+                    depths.append(torch.stack([torch.tensor(frame).float() for frame in depth_frames], dim=0).cuda())
+        renders = torch.stack(rendered, dim=0)
+        info = {}
+        if return_info:
+            if len(alphas) == len(rendered):
+                info["alpha"] = torch.stack(alphas, dim=0)
+            if len(depths) == len(rendered):
+                info["depth"] = torch.stack(depths, dim=0)
+            info["extrinsics"] = torch.stack(extrinsics, dim=0)
+            info["intrinsics"] = torch.stack(intrinsics, dim=0)
+        return renders, info
 
     @torch.no_grad()
     def rollout_group(self, model, cond_image: torch.Tensor, group_size: int, train: bool = True):
@@ -135,10 +156,11 @@ class TrellisStage2GRPORollout:
             verbose=False,
         )
         gaussians, denorm_slat = self._decode_slat(sampler_out.samples)
-        renders = self.render_gaussians(
+        renders, render_info = self.render_gaussians(
             gaussians,
             num_views=self.train_num_views if train else self.eval_num_views,
             resolution=self.train_render_resolution if train else self.eval_render_resolution,
+            return_info=self.return_render_info,
         )
         return {
             "coords": coords,
@@ -148,4 +170,5 @@ class TrellisStage2GRPORollout:
             "slat": denorm_slat,
             "gaussians": gaussians,
             "renders": renders,
+            "render_info": render_info,
         }

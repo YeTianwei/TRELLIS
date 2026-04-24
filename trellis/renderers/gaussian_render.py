@@ -162,6 +162,7 @@ class GaussianRenderer:
             "far": None,
             "ssaa": 1,
             "bg_color": 'random',
+            "return_aux": False,
         })
         self.rendering_options.update(rendering_options)
         self.bg_color = None
@@ -228,4 +229,44 @@ class GaussianRenderer:
         ret = edict({
             'color': render_ret['render']
         })
+        if self.rendering_options.get("return_aux", False):
+            ones = torch.ones_like(gausssian.get_xyz)
+            alpha_ret = render(
+                camera_dict,
+                gausssian,
+                self.pipe,
+                torch.zeros(3, dtype=torch.float32, device="cuda"),
+                override_color=ones,
+                scaling_modifier=self.pipe.scale_modifier,
+            )
+            alpha = alpha_ret.render.mean(dim=0).clamp(0, 1)
+
+            xyz_h = torch.cat(
+                [
+                    gausssian.get_xyz,
+                    torch.ones(gausssian.get_xyz.shape[0], 1, dtype=gausssian.get_xyz.dtype, device=gausssian.get_xyz.device),
+                ],
+                dim=1,
+            )
+            xyz_cam = (view @ xyz_h.T).T[:, :3]
+            view_depth = xyz_cam[:, 2].abs()
+            distance_depth = (gausssian.get_xyz - camera).norm(dim=1)
+            depth_value = ((torch.minimum(view_depth, distance_depth) - near) / max(float(far - near), 1e-6)).clamp(0, 1)
+            depth_color = depth_value[:, None].expand(-1, 3)
+            depth_ret = render(
+                camera_dict,
+                gausssian,
+                self.pipe,
+                torch.zeros(3, dtype=torch.float32, device="cuda"),
+                override_color=depth_color,
+                scaling_modifier=self.pipe.scale_modifier,
+            )
+            depth = (depth_ret.render.mean(dim=0) / alpha.clamp_min(1e-6)).clamp(0, 1)
+
+            if ssaa > 1:
+                alpha = F.interpolate(alpha[None, None], size=(resolution, resolution), mode='bilinear', align_corners=False, antialias=True).squeeze()
+                depth = F.interpolate(depth[None, None], size=(resolution, resolution), mode='bilinear', align_corners=False, antialias=True).squeeze()
+
+            ret['alpha'] = alpha
+            ret['depth'] = depth
         return ret

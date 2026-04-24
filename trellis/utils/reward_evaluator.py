@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,8 @@ class Stage2RewardEvaluator:
         topk_views: int = 2,
         dino_batch_size: int = 1,
         aesthetic_batch_size: int = 1,
+        normal_weight: float = 0.0,
+        normal_mask_threshold: float = 0.1,
         dino_encoder=None,
     ):
         self.image_cond_model_name = image_cond_model
@@ -31,6 +33,8 @@ class Stage2RewardEvaluator:
         self.topk_views = topk_views
         self.dino_batch_size = dino_batch_size
         self.aesthetic_batch_size = aesthetic_batch_size
+        self.normal_weight = normal_weight
+        self.normal_mask_threshold = normal_mask_threshold
         self.dino_encoder = dino_encoder
         self._dino = None
         self._clip_model = None
@@ -110,7 +114,71 @@ class Stage2RewardEvaluator:
         return feats[:, 0]
 
     @torch.no_grad()
-    def score(self, cond: torch.Tensor, renders: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _depth_to_normal(self, depth: torch.Tensor) -> torch.Tensor:
+        dzdx = F.pad(depth[..., :, 2:] - depth[..., :, :-2], (1, 1, 0, 0), mode="replicate") * 0.5
+        dzdy = F.pad(depth[..., 2:, :] - depth[..., :-2, :], (0, 0, 1, 1), mode="replicate") * 0.5
+        normal = torch.stack([-dzdx, -dzdy, torch.ones_like(depth)], dim=-3)
+        return F.normalize(normal, dim=-3, eps=1e-6)
+
+    @torch.no_grad()
+    def _score_normal_depth_consistency(
+        self,
+        renders: torch.Tensor,
+        render_info: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        g, v = renders.shape[:2]
+        if self.normal_weight == 0 or not render_info or "depth" not in render_info:
+            return torch.zeros(g, device=renders.device, dtype=renders.dtype)
+
+        depth = render_info["depth"].to(device=renders.device, dtype=renders.dtype)
+        if depth.dim() == 5 and depth.shape[2] == 1:
+            depth = depth[:, :, 0]
+        if depth.shape[:2] != (g, v):
+            return torch.zeros(g, device=renders.device, dtype=renders.dtype)
+
+        alpha = render_info.get("alpha")
+        if alpha is None:
+            mask = torch.isfinite(depth) & (depth > 0)
+        else:
+            alpha = alpha.to(device=renders.device, dtype=renders.dtype)
+            if alpha.dim() == 5 and alpha.shape[2] == 1:
+                alpha = alpha[:, :, 0]
+            mask = alpha > self.normal_mask_threshold
+        mask = mask & torch.isfinite(depth)
+
+        depth = depth.nan_to_num(0.0).clamp(0, 1)
+        depth_normal = self._depth_to_normal(depth)
+
+        raw_normal = render_info.get("normal")
+        if raw_normal is not None:
+            raw_normal = raw_normal.to(device=renders.device, dtype=renders.dtype)
+            if raw_normal.min() >= 0 and raw_normal.max() <= 1:
+                raw_normal = raw_normal * 2 - 1
+            raw_normal = F.normalize(raw_normal, dim=-3, eps=1e-6)
+            cosine = (raw_normal * depth_normal).sum(dim=-3).clamp(-1, 1)
+            score = (cosine + 1) * 0.5
+        else:
+            smooth_normal = F.avg_pool2d(
+                depth_normal.reshape(g * v, 3, *depth_normal.shape[-2:]),
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ).reshape_as(depth_normal)
+            smooth_normal = F.normalize(smooth_normal, dim=-3, eps=1e-6)
+            score = (depth_normal * smooth_normal).sum(dim=-3).clamp(0, 1)
+
+        valid = mask.reshape(g, v, -1)
+        score = score.reshape(g, v, -1)
+        denom = valid.float().sum(dim=(1, 2)).clamp_min(1.0)
+        return (score * valid.float()).sum(dim=(1, 2)) / denom
+
+    @torch.no_grad()
+    def score(
+        self,
+        cond: torch.Tensor,
+        renders: torch.Tensor,
+        render_info: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             cond: [G, 3, H, W]
@@ -124,9 +192,15 @@ class Stage2RewardEvaluator:
         image_align = align.topk(topk, dim=1).values.mean(dim=1)
 
         aesthetic = self._score_aesthetic(renders.reshape(g * v, *renders.shape[2:])).reshape(g, v).mean(dim=1)
-        total = self.image_align_weight * image_align + self.aesthetic_weight * aesthetic
+        normal_depth_consistency = self._score_normal_depth_consistency(renders, render_info)
+        total = (
+            self.image_align_weight * image_align
+            + self.aesthetic_weight * aesthetic
+            + self.normal_weight * normal_depth_consistency
+        )
         return {
             "reward": total,
             "image_align": image_align,
             "aesthetic": aesthetic,
+            "normal_depth_consistency": normal_depth_consistency,
         }

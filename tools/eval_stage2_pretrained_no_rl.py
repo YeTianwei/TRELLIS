@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--batch_size_per_gpu", type=int, default=1)
     parser.add_argument("--mode", choices=["train", "eval"], default="train")
     parser.add_argument("--i_log", type=int, default=1)
+    parser.add_argument("--reward_normal_weight", type=float, default=None)
     args = parser.parse_args()
 
     import torch
@@ -85,6 +86,8 @@ def main():
     trainer_args["enable_model_snapshot"] = False
     if args.group_size is not None:
         trainer_args["group_size"] = args.group_size
+    if args.reward_normal_weight is not None:
+        trainer_args["reward_normal_weight"] = args.reward_normal_weight
 
     command = "python " + " ".join(sys.argv)
     (output_dir / "command.txt").write_text(command + "\n")
@@ -111,6 +114,7 @@ def main():
     all_rewards = []
     all_image_align = []
     all_aesthetic = []
+    all_normal_depth = []
 
     log_path = output_dir / "log.txt"
     if log_path.exists():
@@ -128,6 +132,7 @@ def main():
         rewards = []
         image_aligns = []
         aesthetics = []
+        normal_depths = []
         with torch.no_grad(), disable_lora(model):
             for data in data_list:
                 data = recursive_to_device(data, trainer.device, non_blocking=True)
@@ -136,24 +141,29 @@ def main():
                     score = trainer.reward_evaluator.score(
                         cond.unsqueeze(0).repeat(group_size, 1, 1, 1),
                         rollout["renders"],
+                        rollout.get("render_info"),
                     )
                     rewards.append(score["reward"])
                     image_aligns.append(score["image_align"])
                     aesthetics.append(score["aesthetic"])
+                    normal_depths.append(score["normal_depth_consistency"])
 
         elapsed += time.time() - start
         reward = mean_item(rewards)
         image_align = mean_item(image_aligns)
         aesthetic = mean_item(aesthetics)
+        normal_depth = mean_item(normal_depths)
         all_rewards.append(reward)
         all_image_align.append(image_align)
         all_aesthetic.append(aesthetic)
+        all_normal_depth.append(normal_depth)
 
         row = {
             "time": {"step": time.time() - start, "elapsed": elapsed},
             "reward": reward,
             "image_align": image_align,
             "aesthetic": aesthetic,
+            "normal_depth_consistency": normal_depth,
             "no_rl_baseline": 1.0,
             "status": {"grad_norm": 0.0},
             "loss": {"loss": 0.0, "policy_loss": 0.0, "kl_loss": 0.0},
@@ -179,6 +189,7 @@ def main():
         "reward_max": max(all_rewards),
         "image_align_mean": statistics.fmean(all_image_align),
         "aesthetic_mean": statistics.fmean(all_aesthetic),
+        "normal_depth_consistency_mean": statistics.fmean(all_normal_depth),
         "elapsed_hours": elapsed / 3600,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=4) + "\n")
